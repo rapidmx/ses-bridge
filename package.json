@@ -1,0 +1,86 @@
+{
+  "name": "@rapidmx/ses-bridge",
+  "version": "0.1.0",
+  "description": "Bridges a RapidMX server's outbound MailTransport interface and inbound /internal/mta ingest contract to AWS SES.",
+  "type": "module",
+  "repository": "https://github.com/rapidmx/ses-bridge",
+  "author": "Jean-Philippe Steinmetz <rapidrests@gmail.com>",
+  "license": "MPL-2.0",
+  "files": [
+    "dist"
+  ],
+  "main": "dist/src/index.js",
+  "types": "dist/src/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/src/index.js",
+      "types": "./dist/src/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "rimraf dist && tsc -p tsconfig.json",
+    "lint": "eslint ./src ./test ./infra",
+    "local-audit": "yarn install && yarn npm audit -A -R \"$@\"",
+    "checkup": "yarn dlx @yarnpkg/doctor \"$@\"",
+    "dependency-check": "yarn dlx depcheck \"$@\"",
+    "report-coverage": "cat ./coverage/lcov.info | coveralls",
+    "test": "vitest run --coverage",
+    "test:watch": "vitest --watch --coverage",
+    "cdk": "cdk",
+    "synth": "cdk synth",
+    "diff": "cdk diff",
+    "deploy": "cdk deploy"
+  },
+  "prettier": {
+    "printWidth": 120,
+    "semi": true,
+    "singleQuote": false,
+    "tabWidth": 4,
+    "trailingComma": "es5"
+  },
+  "peerDependencies": {
+    "@rapidmx/restapi": ">=0.4.0",
+    "@rapidrest/core": "5.x"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.906.0",
+    "@aws-sdk/client-ses": "^3.906.0",
+    "@aws-sdk/client-sesv2": "^3.906.0"
+  },
+  "devDependencies": {
+    "@rapidmx/restapi": "^0.4.0",
+    "@rapidrest/core": "^5.2.2",
+    "@types/aws-lambda": "^8.10.156",
+    "@types/node": "^26.5.0",
+    "@typescript-eslint/eslint-plugin": "^8.70.0",
+    "@typescript-eslint/parser": "^8.70.0",
+    "@vitest/coverage-v8": "^5.0.0",
+    "aws-cdk": "^2.1030.0",
+    "aws-cdk-lib": "^2.216.0",
+    "axios": "^1.20.0",
+    "constructs": "^10.4.2",
+    "coveralls": "^3.1.1",
+    "esbuild": "^0.28.2",
+    "eslint": "^10.10.0",
+    "eslint-plugin-import": "^2.32.0",
+    "eslint-plugin-jsdoc": "^64.3.8",
+    "globals": "^17.12.0",
+    "redis": "^6.2.1",
+    "reflect-metadata": "^0.2.2",
+    "rimraf": "^6.1.3",
+    "tsx": "^4.23.13",
+    "typescript": "^6.0.3",
+    "vite": "^8.2.2",
+    "vitest": "^5.0.0",
+    "winston": "^3.19.0",
+    "winston-transport": "^4.9.0"
+  },
+  "packageManager": "yarn@4.5.3",
+  "engines": {
+    "node": ">=24.0.0"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org/"
+  }
+}
