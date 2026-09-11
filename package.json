@@ -29,7 +29,9 @@
     "cdk": "cdk",
     "synth": "cdk synth",
     "diff": "cdk diff",
-    "deploy": "cdk deploy"
+    "deploy": "cdk deploy",
+    "release": "npx @rapidrest/cli release",
+    "prepublish": "yarn build"
   },
   "prettier": {
     "printWidth": 120,

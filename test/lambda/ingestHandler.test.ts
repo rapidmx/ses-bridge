@@ -166,4 +166,46 @@ describe("ingestHandler Tests", () => {
         expect(mockS3Send).toHaveBeenCalledWith(expect.objectContaining({ input: { Bucket: "test-bucket", Key: "inbound/msg-a" } }));
         expect(mockS3Send).toHaveBeenCalledWith(expect.objectContaining({ input: { Bucket: "test-bucket", Key: "inbound/msg-b" } }));
     });
+
+    it("Falls back to mailer-daemon@localhost when the bounced recipient address has no domain.", async () => {
+        mockResolveRecipient.mockResolvedValue(false);
+
+        await handler(makeEvent(["not-an-email-address"]));
+
+        expect(mockSesSend).toHaveBeenCalledWith(
+            expect.objectContaining({ input: expect.objectContaining({ BounceSender: "mailer-daemon@localhost" }) }),
+        );
+    });
+
+    it("Uses an empty S3 object key prefix when SES_OBJECT_KEY_PREFIX is unset.", async () => {
+        const originalPrefix = process.env.SES_OBJECT_KEY_PREFIX;
+        delete process.env.SES_OBJECT_KEY_PREFIX;
+        vi.resetModules();
+        const { handler: handlerWithNoPrefix } = await import("../../src/lambda/ingestHandler.js");
+
+        mockResolveRecipient.mockResolvedValue(true);
+        mockS3Send.mockResolvedValue(s3GetObjectResponse("raw"));
+
+        await handlerWithNoPrefix(makeEvent(["a@example.com"], { messageId: "msg-42" }));
+
+        expect(mockS3Send).toHaveBeenCalledWith(expect.objectContaining({ input: { Bucket: "test-bucket", Key: "msg-42" } }));
+
+        process.env.SES_OBJECT_KEY_PREFIX = originalPrefix;
+        vi.resetModules();
+        ({ handler } = await import("../../src/lambda/ingestHandler.js"));
+    });
+
+    it("throws at import time if a required env var is missing (requireEnv's own guard).", async () => {
+        // Run last and restore `handler` to a freshly-imported, fully-configured module afterward -
+        // every other test in this file shares the one `handler` captured by the outer beforeAll().
+        const originalBucketName = process.env.SES_BUCKET_NAME;
+        delete process.env.SES_BUCKET_NAME;
+        vi.resetModules();
+
+        await expect(import("../../src/lambda/ingestHandler.js")).rejects.toThrow("SES_BUCKET_NAME must be set");
+
+        process.env.SES_BUCKET_NAME = originalBucketName;
+        vi.resetModules();
+        ({ handler } = await import("../../src/lambda/ingestHandler.js"));
+    });
 });

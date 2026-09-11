@@ -1,0 +1,72 @@
+name: Publish
+
+on:
+  workflow_run:
+    workflows: ["Build"]
+    types:
+      - completed
+
+permissions:
+  id-token: write  # Required for OIDC
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    if: github.event.workflow_run.conclusion == 'success'
+    outputs:
+      is_release_tag: ${{ steps.gate.outputs.is_release_tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          fetch-depth: 0
+
+      - name: Determine if this build was for a tag on main
+        id: gate
+        run: |
+          tag=$(git tag --points-at HEAD)
+          if [ -n "$tag" ] && git merge-base --is-ancestor HEAD origin/main; then
+            echo "is_release_tag=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "is_release_tag=false" >> "$GITHUB_OUTPUT"
+          fi
+
+  publish:
+    needs: check
+    if: needs.check.outputs.is_release_tag == 'true'
+    runs-on: ubuntu-latest
+    environment: publish
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: '24'
+          registry-url: 'https://registry.npmjs.org'
+          package-manager-cache: false  # never use caching in release builds
+
+      - name: Enable corepack
+        run: corepack enable
+
+      - name: Restore node_modules cache
+        uses: actions/cache@v4
+        with:
+          path: |
+            node_modules
+            dist
+            docs
+          key: ${{ runner.os }}-yarn-${{ hashFiles('yarn.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-yarn-
+
+      - name: Install dependencies
+        run: export REDISMS_DISABLE_POSTINSTALL=true && yarn install --frozen-lockfile
+
+      - name: Build
+        run: yarn build
+
+      - name: Publish to npm
+        run: npm publish --access public

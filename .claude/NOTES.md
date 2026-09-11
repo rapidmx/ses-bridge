@@ -1,4 +1,4 @@
-# Code review notes — rapidmx/ses-bridge
+# Code review notes — rapidrest/mail-server
 
 This file exists so that Claude sessions working in this repo don't re-litigate settled
 decisions or re-discover the same issues from scratch. It is local to this repo (not tied to
@@ -44,61 +44,34 @@ Keep entries terse — this is a reference, not a transcript.
   each sibling repo's own NOTES.md rather than paraphrasing it, since the paraphrase is what caused
   this to be gotten wrong in the first place (see `@rapidrest/cli`'s own NOTES.md, 2026-09-07 entry,
   for the full incident writeup and the `CHANGELOG_NOISE_PATTERNS` fix that accompanied it).
-- **Never bump a `package.json` `version` field, in this repo or any sibling `@rapidrest/*`/
-  `@rapidmx/*` repo, and never publish/`npm publish` one.** JP has a formal release process for
-  that. This applies even when a fix in a sibling repo is otherwise done and verified: land the
-  source fix, leave the version field alone, and tell JP it's ready for him to version/publish
-  himself. Once he publishes, bump *this* repo's dependency constraint (e.g.
-  `"@rapidmx/restapi": "^X.Y.Z"`) to the version he actually published — that part is fine, since
-  it's just declaring what this repo needs, not deciding a sibling repo's own release number.
-- **This repo is a hybrid, not a pure app like `postfix-bridge`**: `src/transport/` is a published
-  library entry point (`@rapidmx/ses-bridge`'s `SesMailTransport`, imported by `@rapidmx/server`
-  and registered via `objectFactory.register(SesMailTransport, "MailTransport")` exactly like
-  `PostfixSendmailTransport`), while `src/lambda/` + `infra/` is deployable AWS infrastructure (a
-  Lambda invoked by an SES receipt rule, provisioned via CDK) — there is no long-running daemon and
-  no Docker image/Helm chart the way `postfix-bridge` has. Don't reflexively add
-  Dockerfile/docker-compose/helm back in for "parity" with the sibling repo; the deployment shape
-  is genuinely different here. Outbound (`SesMailTransport`) lives here rather than in
-  `@rapidmx/restapi` by JP's explicit choice, to keep all SES-specific code in one place, even
-  though it would otherwise fit `restapi`'s own `MailTransport`-implementation precedent
-  (`PostfixSendmailTransport`) just as well. Recipient rejection is "accept, then bounce" rather
-  than a live SMTP-time reject, also by explicit choice — SES has no synchronous pre-accept hook
-  the way Postfix's `tcp_table` does; a Lambda action only runs after SES has already accepted the
-  message, so an unresolvable recipient is handled by calling `ses:SendBounce` for just that
-  recipient rather than rejecting during the SMTP conversation.
-- **DKIM: SES Easy DKIM, not RapidMX-generated keys.** `FsDkimKeyProvider`/`NullDkimKeyProvider`
-  from `@rapidmx/restapi` are irrelevant to domains relayed through this bridge — SES generates and
-  manages its own DKIM key material per verified identity (3 CNAME records to publish), so this
-  repo never touches `Domain.dkimSelector`/`dkimPublicKey`. Wiring those 3 CNAMEs into the admin
-  console's DNS-setup checklist UI is an explicitly separate, not-yet-scoped follow-up in
-  `@rapidmx/restapi`/`@rapidmx/server` — not this repo's job.
+- **Never bump a `package.json` `version` field, in this repo or any sibling `@rapidrest/*` repo,
+  and never publish/`npm publish` one.** JP has a formal release process for that (see e.g.
+  `mail-server`'s own `"version"`/`"postversion"` npm-lifecycle scripts, which sync the Helm
+  chart/README and push tags — a manual version edit bypasses all of that and produces conflicts).
+  This applies even when a fix in a sibling repo is otherwise done and verified: land the source
+  fix, leave the version field alone, and tell JP it's ready for him to version/publish himself.
+  Once he publishes, bump *this* repo's dependency constraint (e.g. `"@rapidrest/auth": "^X.Y.Z"`)
+  to the version he actually published — that part is fine, since it's just declaring what this
+  repo needs, not deciding a sibling repo's own release number.
 
 ## Session Log
 
-### 2026-09-10 — Initial scaffold
+### 2026-09-11 — 100% coverage, real CONTRIBUTING.md
 
-Repo created fresh, scaffolded from `postfix-bridge`'s "universal pieces" (`.claude`, `.github`,
-`.gitignore`, `.gitattributes`, `.npmignore`, `.yarnrc.yml`, `.vscode`, `validate.sh`,
-`eslint.config.mjs`, `tsconfig*.json`, `vitest.config.ts`, `CONTRIBUTING.md`/`CONTRIBUTORS.md`,
-`LICENSE`) at JP's explicit request, per the scoping conversation that preceded this (see the
-session's own summary; not yet copied into this file's history since this repo didn't exist yet).
+`ingestHandler.ts` had a handful of uncovered branches (`SesMailTransport.ts`/`MtaIngestClient.ts`
+were already fully covered). Brought the whole package to 100% statements/branches/functions/lines
+and pinned it via a new `thresholds` block in `vitest.config.ts` (there wasn't one before).
 
-Deliberate departures from `postfix-bridge`'s template, all because this repo's actual deployment
-shape differs (see the standing decision above):
-- No `Dockerfile`/`docker-compose.yml`/`helm/` — nothing here runs as a long-lived container.
-- `tsconfig.json` has `declaration: true` (postfix-bridge's is `false`) - this repo publishes
-  `SesMailTransport` as a library, so `.d.ts` output is required, unlike a pure standalone app.
-- `package.json` is scoped (`@rapidmx/ses-bridge`) with real `exports`/`types`, matching
-  `@rapidmx/restapi`'s pattern, not `postfix-bridge`'s unscoped/no-exports app-only shape. Treats
-  `@rapidmx/restapi`/`@rapidrest/core` as `peerDependencies` (supplied by whatever app installs
-  this package) rather than direct `dependencies`, again mirroring `restapi`'s own precedent for
-  its own peer-supplied host framework packages.
-- `.github/workflows/ci.yml` keeps `postfix-bridge`'s build/lint/test/validate job shape verbatim,
-  but swaps its Docker-image/Helm-chart publish jobs for a tag-gated `npm publish` job (matching
-  `@rapidmx/restapi`'s own publish workflow) plus a `test-cdk-synth` job (sanity-checks
-  `infra/`'s CDK app synthesizes, deliberately without real AWS credentials).
-- `.vscode/launch.json` drops `postfix-bridge`'s "Docker: Attach to Node" entry (no container) and
-  its already-stale `vscode-jest-tests` entry (that repo uses vitest, not jest, too — a template
-  artifact there, not worth propagating) in favor of vitest-watch and `cdk synth` launch configs.
-
-Not committed - same standing rule; JP reviews and commits when ready.
+- Added coverage for `requireEnv()`'s own throw branch (a required env var missing at import time),
+  `objectKeyFor()`'s `SES_OBJECT_KEY_PREFIX ?? ""` fallback, and `bounceRecipients()`'s
+  `recipients[0].split("@")[1] ?? "localhost"` fallback (a malformed/no-domain recipient address) -
+  all three needed a fresh `vi.resetModules()` + re-`import()` of `ingestHandler.js` per case, since
+  its config is read eagerly at module load (see that file's own doc comment on why) - same pattern
+  `postfix-bridge`'s `test/index.test.ts` and `electron-client`'s `test/main/index.test.ts` both use
+  for the same reason. The existing test file's shared `beforeAll()`-imported `handler` is restored
+  afterward so later tests in the same file keep using a fully-configured module.
+- Fixed `CONTRIBUTING.md`'s bug-report/feature-request examples, which were the generic RapidMX
+  template's `@rapidrest`/admin-console-flavored ones (copy-pasted from `server`/`restapi`, not this
+  bridge) - replaced with an `ingestHandler`/bounce-relevant example and Project Info fields
+  (package version, outbound vs. inbound, AWS region).
+- Not committed - JP said "hold off on commit" for this whole cross-repo pass.

@@ -15,6 +15,14 @@ export default defineConfig({
             include: ['src/**/*.ts'],
             exclude: ['**/node_modules/**', '**/test/**'],
             reporter: ['text', 'json', 'html', 'lcov'],
+            thresholds: {
+                'src/**': {
+                    branches: 100,
+                    functions: 100,
+                    lines: 100,
+                    statements: 100,
+                },
+            },
             reportsDirectory: 'coverage',
         },
         reporters: ['default', 'junit'],

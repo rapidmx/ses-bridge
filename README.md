@@ -1,6 +1,7 @@
 # RapidMX: SES Bridge
-
-[![CI](https://github.com/rapidmx/ses-bridge/actions/workflows/ci.yml/badge.svg?branch=main)](https://github.com/rapidmx/ses-bridge/actions/workflows/ci.yml)
+[![CI](https://github.com/RapidMX/ses-bridge/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/RapidMX/ses-bridge/actions/workflows/build.yml)
+[![Coverage Status](https://coveralls.io/repos/github/RapidMX/ses-bridge/badge.svg?branch=main)](https://coveralls.io/github/RapidMX/ses-bridge?branch=main)
+[![npm version](https://img.shields.io/npm/v/@rapidmx/ses-bridge)](https://www.npmjs.com/package/@rapidmx/ses-bridge)
 
 Bridges a [RapidMX server](https://github.com/rapidmx/server) to AWS SES for real inbound/outbound mail
 transport - the SES equivalent of [`postfix-bridge`](https://github.com/rapidmx/postfix-bridge), but a
@@ -10,7 +11,7 @@ event-driven, not a protocol this repo needs to speak on a socket.
 This repo is two things in one:
 
 - **A published library** (`@rapidmx/ses-bridge`) exporting `SesMailTransport`, a `MailTransport`
-  implementation (see `@rapidmx/restapi`) that hands outbound mail to SES's `SendEmail` API directly -
+  implementation (see `@rapidmx/ses-bridge`) that hands outbound mail to SES's `SendEmail` API directly -
   install it alongside `@rapidmx/server` and register it in place of `PostfixSendmailTransport`.
 - **A CDK app** (`infra/`) that provisions everything inbound mail needs: an SES email identity (Easy
   DKIM), an S3 bucket to stage raw messages, a Lambda (`src/lambda/ingestHandler.ts`) that resolves
@@ -99,7 +100,7 @@ already accepted the message. See `.claude/NOTES.md` for the full rationale.
 - **DNS-setup checklist UI** - the admin console's DNS-setup checklist (`Domain.dkimSelector`/
   `dkimPublicKey`) models the single-TXT-record RapidMX-generated-key flow, not Easy DKIM's 3-CNAME
   model this bridge uses. Publishing the CNAMEs is a manual step (above) until that UI is updated in
-  `@rapidmx/restapi`/`@rapidmx/server` - a separate, not-yet-scoped change.
+  `@rapidmx/ses-bridge`/`@rapidmx/server` - a separate, not-yet-scoped change.
 
 ## Debugging
 
