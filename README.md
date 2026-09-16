@@ -42,18 +42,26 @@ git clone https://github.com/rapidmx/ses-bridge
 cd ses-bridge
 corepack enable
 yarn install
-SES_BRIDGE_DOMAIN_NAME=mail.example.com \
-MTA_INGEST_BASE_URL=https://mail.example.com/internal/mta \
+SES_BRIDGE_DOMAIN_NAME=example.com \
+MTA_INGEST_BASE_URL=http://internal-rapidmx-ingest-1234.us-east-1.elb.amazonaws.com/internal/mta \
 MTA_INGEST_SECRET=<same value as the server's mail__transport__ingest__secret> \
+SES_BRIDGE_VPC_ID=vpc-0123456789abcdef0 SES_BRIDGE_SUBNET_IDS=subnet-aaa,subnet-bbb \
 yarn deploy
 ```
 
 | Environment variable | Purpose |
 | --- | --- |
 | `SES_BRIDGE_DOMAIN_NAME` | The mail domain this stack verifies, receives for, and sends as (default `example.com` - one domain per stack instance; deploy a second stack for a second domain) |
-| `MTA_INGEST_BASE_URL` | Base URL of the RapidMX server's `/internal/mta` contract this bridge forwards to |
+| `MTA_INGEST_BASE_URL` | Base URL of the RapidMX server's `/internal/mta` contract this bridge forwards to. A server deployed by [`server/deploy/aws`](https://github.com/rapidmx/server/tree/main/deploy/aws) keeps that API off the public internet, so this is its **internal** load balancer's address and the two variables below are required |
 | `MTA_INGEST_SECRET` | Bearer secret authenticating this bridge's calls - must match that server's own `mail__transport__ingest__secret` exactly |
+| `SES_BRIDGE_VPC_ID` | The VPC to run the ingest Lambda inside, so it can reach an internal `MTA_INGEST_BASE_URL`. Without it the Lambda runs outside any VPC and that URL must be public |
+| `SES_BRIDGE_SUBNET_IDS` | Comma-separated subnets in that VPC for the Lambda. They need egress (a NAT gateway, or VPC endpoints for S3 and SES): the handler reads each raw message from S3 and bounces through SES |
+| `SES_BRIDGE_AVAILABILITY_ZONES` | Optional, the zones of those subnets in the same order. Only needed because the stack describes the VPC rather than looking it up, so `cdk synth` needs no credentials |
 | `CDK_DEFAULT_ACCOUNT` / `CDK_DEFAULT_REGION` | Standard CDK environment targeting - see the [CDK docs](https://docs.aws.amazon.com/cdk/v2/guide/environments.html) |
+
+The stack outputs `IngestHandlerSecurityGroupId` when it runs in a VPC: allow it on the server's internal
+ingest load balancer (or cover the subnets with the chart's
+`mail.ingestService.loadBalancerSourceRanges`).
 
 **Known v1 simplification**: `MTA_INGEST_SECRET` is passed straight through as a plain Lambda environment
 variable, visible in the Lambda console and this stack's own CloudFormation template. Fine for initial

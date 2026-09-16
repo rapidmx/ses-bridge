@@ -75,3 +75,26 @@ and pinned it via a new `thresholds` block in `vitest.config.ts` (there wasn't o
   bridge) - replaced with an `ingestHandler`/bounce-relevant example and Project Info fields
   (package version, outbound vs. inbound, AWS region).
 - Not committed - JP said "hold off on commit" for this whole cross-repo pass.
+
+## 2026-09-15 — Ingest Lambda can run inside a VPC
+
+The RapidMX server's own CloudFormation deployment (`server/deploy/aws`) keeps `/internal/mta` off the public internet:
+the chart's `mail.ingestService` is an internal load balancer, and the public Gateway answers 404 for `/internal`. So
+`ingestHandler` has to run inside that VPC.
+
+- **Props:** `vpcId`, `subnetIds` (required together; `subnetIds` empty with a `vpcId` throws) and optional
+  `availabilityZones`. `Vpc.fromVpcAttributes` with `privateSubnetIds`, deliberately not `Vpc.fromLookup`, so
+  `cdk synth` still runs without AWS credentials (CI's synth job uses placeholder values). `vpcSubnets` is
+  `vpc.privateSubnets`, i.e. the subnets given in the order given.
+- **Security group:** created only in the VPC case, outbound-only, and output as `IngestHandlerSecurityGroupId` so it can
+  be allowed on the server's ingest load balancer (the chart's `mail.ingestService.loadBalancerSourceRanges` covers the
+  same thing by CIDR, which is what the server's template does by default with the VPC CIDR).
+- **Egress caveat, documented not solved:** a Lambda in a VPC loses default internet access, and this handler reads each
+  raw message from S3 and bounces through SES. Those subnets need a NAT gateway or VPC endpoints; the server's template
+  creates a single public subnet, so a VPC-attached Lambda there needs one added.
+- `SES_BRIDGE_VPC_ID` / `SES_BRIDGE_SUBNET_IDS` / `SES_BRIDGE_AVAILABILITY_ZONES` in `infra/bin/app.ts`, README and
+  release notes. The README example now uses the `example.com` mail domain with an internal ingest URL.
+
+Verified: `tsc --noEmit`, eslint, 18 tests; `cdk synth` without a VPC (unchanged) and with
+`SES_BRIDGE_VPC_ID=vpc-… SES_BRIDGE_SUBNET_IDS=subnet-aaa,subnet-bbb` - the Lambda gets a `VpcConfig` with both subnets
+and the new security group, and CDK attaches AWSLambdaVPCAccessExecutionRole. Not deployed to AWS.

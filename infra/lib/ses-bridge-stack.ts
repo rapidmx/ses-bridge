@@ -4,7 +4,8 @@
 ///////////////////////////////////////////////////////////////////////////////
 import * as path from "path";
 import { fileURLToPath } from "url";
-import { CfnOutput, Duration, RemovalPolicy, Stack, StackProps } from "aws-cdk-lib";
+import { CfnOutput, Duration, Fn, RemovalPolicy, Stack, StackProps } from "aws-cdk-lib";
+import { IVpc, SecurityGroup, SubnetSelection, Vpc } from "aws-cdk-lib/aws-ec2";
 import { PolicyStatement } from "aws-cdk-lib/aws-iam";
 import { Runtime } from "aws-cdk-lib/aws-lambda";
 import { NodejsFunction } from "aws-cdk-lib/aws-lambda-nodejs";
@@ -21,9 +22,28 @@ export interface SesBridgeStackProps extends StackProps {
     readonly domainName: string;
 
     /** Base URL of the RapidMX server's `/internal/mta` contract this bridge forwards to - e.g.
-     * `https://mail.example.com/internal/mta`. See this repo's README for the VPC-networking
-     * prerequisite if `server` isn't reachable from the public internet. */
+     * `https://mail.example.com/internal/mta`. A server deployed by this project's own CloudFormation
+     * template (`server/deploy/aws`) keeps that API off the public internet, so the URL is its internal
+     * load balancer's and `vpcId`/`subnetIds` below are required to reach it. */
     readonly mtaIngestBaseUrl: string;
+
+    /** The VPC to run `ingestHandler` inside, so it can reach a `mtaIngestBaseUrl` that isn't public -
+     * the RapidMX server chart's `mail.ingestService` load balancer is internal to its own VPC. Requires
+     * `subnetIds`. Left unset, the Lambda runs outside any VPC and `mtaIngestBaseUrl` must be reachable
+     * from the internet. */
+    readonly vpcId?: string;
+
+    /** Subnets in `vpcId` to place `ingestHandler` in. They need a route to the internet (a NAT gateway,
+     * i.e. private subnets) or VPC endpoints for S3 and SES: the handler reads each raw message from S3
+     * and bounces through SES, neither of which it can reach from a subnet with no egress. */
+    readonly subnetIds?: string[];
+
+    /** The availability zones of `subnetIds`, in the same order. Only needed because this stack
+     * describes the VPC by its attributes rather than looking it up, so that `cdk synth` needs no AWS
+     * credentials.
+     *
+     * @default the region's own zones, in order */
+    readonly availabilityZones?: string[];
 
     /**
      * Bearer secret authenticating `ingestHandler`'s calls to `mtaIngestBaseUrl` - must match that
@@ -88,11 +108,40 @@ export class SesBridgeStack extends Stack {
             removalPolicy: RemovalPolicy.RETAIN,
         });
 
+        // Inside a VPC only when asked for: a Lambda with no VPC reaches a public mtaIngestBaseUrl directly,
+        // while one in a VPC loses that default internet access and depends on the subnets' own egress.
+        let vpc: IVpc | undefined;
+        let vpcSubnets: SubnetSelection | undefined;
+        let ingestSecurityGroup: SecurityGroup | undefined;
+        if (props.vpcId) {
+            if (!props.subnetIds || props.subnetIds.length === 0) {
+                throw new Error("subnetIds is required with vpcId: the Lambda needs subnets to run in.");
+            }
+            vpc = Vpc.fromVpcAttributes(this, "Vpc", {
+                vpcId: props.vpcId,
+                // Describing the VPC rather than Vpc.fromLookup() keeps `cdk synth` credential-free (see
+                // infra/bin/app.ts). Only the subnets below are ever used from it.
+                availabilityZones: props.availabilityZones ?? Fn.getAzs(),
+                privateSubnetIds: props.subnetIds,
+            });
+            // The subnets given, in the order given: fromVpcAttributes' privateSubnetIds are what it returns here.
+            vpcSubnets = { subnets: vpc.privateSubnets };
+            ingestSecurityGroup = new SecurityGroup(this, "IngestHandlerSecurityGroup", {
+                vpc,
+                description: "RapidMX ses-bridge ingest handler",
+                // Outbound only: to the server's internal load balancer, S3 and SES. Nothing connects to it.
+                allowAllOutbound: true,
+            });
+        }
+
         const ingestFn: NodejsFunction = new NodejsFunction(this, "IngestHandler", {
             entry: path.join(moduleDir, "../../src/lambda/ingestHandler.ts"),
             handler: "handler",
             runtime: Runtime.NODEJS_24_X,
             timeout: Duration.seconds(30),
+            vpc,
+            vpcSubnets,
+            securityGroups: ingestSecurityGroup ? [ingestSecurityGroup] : undefined,
             environment: {
                 MTA_INGEST_BASE_URL: props.mtaIngestBaseUrl,
                 MTA_INGEST_SECRET: props.mtaIngestSecret,
@@ -133,6 +182,14 @@ export class SesBridgeStack extends Stack {
             description: `Point ${props.domainName}'s MX record at this value (priority 10) to receive mail via this stack`,
             value: `10 inbound-smtp.${Stack.of(this).region}.amazonaws.com`,
         });
+        if (ingestSecurityGroup) {
+            new CfnOutput(this, "IngestHandlerSecurityGroupId", {
+                description:
+                    "The ingest handler's security group - allow it on the server's internal ingest load balancer " +
+                    "(the chart's mail.ingestService.loadBalancerSourceRanges covers this by CIDR instead)",
+                value: ingestSecurityGroup.securityGroupId,
+            });
+        }
         new CfnOutput(this, "ActivateRuleSetCommand", {
             description: "Run this after every deploy - CloudFormation cannot mark a receipt rule set active",
             value: `aws ses set-active-receipt-rule-set --rule-set-name ${ruleSet.receiptRuleSetName}`,
