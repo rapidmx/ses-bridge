@@ -9,23 +9,29 @@
 // inside beforeAll(), after the mocks above are in place but before anything under test runs.
 import type { SESEvent } from "aws-lambda";
 
-// `mockImplementation` here must be a real `function`, not an arrow function - every one of these is
-// invoked with `new` by the code under test, and arrow functions can never be constructors.
+// `mockImplementation`/`mockS3ClientCtor` etc. here must be real `function`s, not arrow functions - every
+// one of these is invoked with `new` by the code under test, and arrow functions can never be constructors.
+// The constructor mocks are declared as outer `const`s (not inline inside the `vi.mock()` factory) and
+// captured by closure, so they stay the SAME reference across a `vi.resetModules()` + re-import (several
+// tests below need that, to assert what options the code under test constructed these clients with after
+// re-importing it with different env vars) - mirroring postfix-bridge's own `test/index.test.ts` pattern.
 const mockS3Send = vi.fn();
+const mockS3ClientCtor = vi.fn(function (this: { send: typeof mockS3Send }) {
+    this.send = mockS3Send;
+});
 vi.mock("@aws-sdk/client-s3", () => ({
-    S3Client: vi.fn().mockImplementation(function () {
-        return { send: mockS3Send };
-    }),
+    S3Client: mockS3ClientCtor,
     GetObjectCommand: vi.fn().mockImplementation(function (input: any) {
         return { input };
     }),
 }));
 
 const mockSesSend = vi.fn();
+const mockSesClientCtor = vi.fn(function (this: { send: typeof mockSesSend }) {
+    this.send = mockSesSend;
+});
 vi.mock("@aws-sdk/client-ses", () => ({
-    SESClient: vi.fn().mockImplementation(function () {
-        return { send: mockSesSend };
-    }),
+    SESClient: mockSesClientCtor,
     SendBounceCommand: vi.fn().mockImplementation(function (input: any) {
         return { input };
     }),
@@ -33,10 +39,13 @@ vi.mock("@aws-sdk/client-ses", () => ({
 
 const mockResolveRecipient = vi.fn();
 const mockDeliver = vi.fn();
+const mockMtaIngestClientCtor = vi.fn(function (this: Record<string, unknown>) {
+    this.resolveRecipient = mockResolveRecipient;
+    this.deliver = mockDeliver;
+});
 vi.mock("../../src/lambda/MtaIngestClient.js", () => ({
-    MtaIngestClient: vi.fn().mockImplementation(function () {
-        return { resolveRecipient: mockResolveRecipient, deliver: mockDeliver };
-    }),
+    MtaIngestClient: mockMtaIngestClientCtor,
+    DEFAULT_MTA_INGEST_TIMEOUT_MS: 10_000,
 }));
 
 let handler: (event: SESEvent) => Promise<{ disposition: "CONTINUE" | "STOP_RULE_SET" }>;
@@ -226,6 +235,55 @@ describe("ingestHandler Tests", () => {
         expect(result).toEqual({ disposition: "CONTINUE" });
     });
 
+    it("Resolves the other recipients of a record even when one resolveRecipient() call throws - no longer all-or-nothing.", async () => {
+        // Regression: Promise.all() (the previous implementation) is all-or-nothing - one recipient hitting
+        // a transient error used to reject the whole array and silently discard every OTHER recipient's
+        // already-computed result too, dropping the entire record (no delivery, no bounce, just a
+        // console.error) over a single recipient's transient failure. Promise.allSettled() fixes that: the
+        // failing recipient is bounced (treated the same as an explicit "doesn't resolve"), while its
+        // neighbor in the same record still gets delivered normally.
+        const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+        mockResolveRecipient.mockImplementation(async (rcpt: string) => {
+            if (rcpt === "flaky@example.com") {
+                throw new Error("upstream 500");
+            }
+            return true;
+        });
+        mockS3Send.mockResolvedValue(s3GetObjectResponse("raw"));
+
+        const result = await handler(makeEvent(["flaky@example.com", "ok@example.com"]));
+
+        expect(mockDeliver).toHaveBeenCalledWith("sender@external.com", ["ok@example.com"], expect.any(Buffer));
+        expect(mockSesSend).toHaveBeenCalledWith(
+            expect.objectContaining({
+                input: expect.objectContaining({
+                    BouncedRecipientInfoList: [{ Recipient: "flaky@example.com", BounceType: "DoesNotExist" }],
+                }),
+            }),
+        );
+        expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("flaky@example.com"), expect.any(Error));
+        expect(result).toEqual({ disposition: "CONTINUE" });
+
+        consoleErrorSpy.mockRestore();
+    });
+
+    it("Derives the DSN bounce's ReportingMta from the recipient domain and ArrivalDate from the message's own SES-recorded arrival time.", async () => {
+        mockResolveRecipient.mockResolvedValue(false);
+
+        await handler(makeEvent(["unknown@example.com"]));
+
+        expect(mockSesSend).toHaveBeenCalledWith(
+            expect.objectContaining({
+                input: expect.objectContaining({
+                    MessageDsn: expect.objectContaining({
+                        ReportingMta: "dns; example.com",
+                        ArrivalDate: new Date("2026-09-10T00:00:00.000Z"),
+                    }),
+                }),
+            }),
+        );
+    });
+
     it("Falls back to mailer-daemon@localhost when the bounced recipient address has no domain.", async () => {
         mockResolveRecipient.mockResolvedValue(false);
 
@@ -250,6 +308,53 @@ describe("ingestHandler Tests", () => {
         expect(mockS3Send).toHaveBeenCalledWith(expect.objectContaining({ input: { Bucket: "test-bucket", Key: "msg-42" } }));
 
         process.env.SES_OBJECT_KEY_PREFIX = originalPrefix;
+        vi.resetModules();
+        ({ handler } = await import("../../src/lambda/ingestHandler.js"));
+    });
+
+    it.each(["not-a-number", "", "0", "-1"])(
+        "throws at import time if MTA_INGEST_TIMEOUT_MS is set to an invalid value (%j) - requirePositiveNumber's own guard.",
+        async (badValue) => {
+            process.env.MTA_INGEST_TIMEOUT_MS = badValue;
+            vi.resetModules();
+
+            await expect(import("../../src/lambda/ingestHandler.js")).rejects.toThrow(
+                "MTA_INGEST_TIMEOUT_MS must be a positive number if set",
+            );
+
+            delete process.env.MTA_INGEST_TIMEOUT_MS;
+            vi.resetModules();
+            ({ handler } = await import("../../src/lambda/ingestHandler.js"));
+        },
+    );
+
+    it("Uses MtaIngestClient's own default timeout, and passes it to the S3/SES request handlers too, when MTA_INGEST_TIMEOUT_MS is unset.", async () => {
+        delete process.env.MTA_INGEST_TIMEOUT_MS;
+        vi.resetModules();
+
+        await import("../../src/lambda/ingestHandler.js");
+
+        expect(mockMtaIngestClientCtor).toHaveBeenCalledWith("http://server:3000/internal/mta", "s3cr3t", 10_000);
+        const expectedRequestHandler = { connectionTimeout: 10_000, requestTimeout: 10_000, throwOnRequestTimeout: true };
+        expect(mockS3ClientCtor).toHaveBeenCalledWith(expect.objectContaining({ requestHandler: expectedRequestHandler }));
+        expect(mockSesClientCtor).toHaveBeenCalledWith(expect.objectContaining({ requestHandler: expectedRequestHandler }));
+
+        vi.resetModules();
+        ({ handler } = await import("../../src/lambda/ingestHandler.js"));
+    });
+
+    it("Plumbs a custom MTA_INGEST_TIMEOUT_MS through to MtaIngestClient and the S3/SES request handlers.", async () => {
+        process.env.MTA_INGEST_TIMEOUT_MS = "5000";
+        vi.resetModules();
+
+        await import("../../src/lambda/ingestHandler.js");
+
+        expect(mockMtaIngestClientCtor).toHaveBeenCalledWith("http://server:3000/internal/mta", "s3cr3t", 5000);
+        const expectedRequestHandler = { connectionTimeout: 5000, requestTimeout: 5000, throwOnRequestTimeout: true };
+        expect(mockS3ClientCtor).toHaveBeenCalledWith(expect.objectContaining({ requestHandler: expectedRequestHandler }));
+        expect(mockSesClientCtor).toHaveBeenCalledWith(expect.objectContaining({ requestHandler: expectedRequestHandler }));
+
+        delete process.env.MTA_INGEST_TIMEOUT_MS;
         vi.resetModules();
         ({ handler } = await import("../../src/lambda/ingestHandler.js"));
     });

@@ -4,7 +4,7 @@
 ///////////////////////////////////////////////////////////////////////////////
 import * as path from "path";
 import { fileURLToPath } from "url";
-import { CfnOutput, Duration, Fn, RemovalPolicy, Stack, StackProps } from "aws-cdk-lib";
+import { Annotations, CfnOutput, Duration, Fn, RemovalPolicy, Stack, StackProps } from "aws-cdk-lib";
 import { IVpc, SecurityGroup, SubnetSelection, Vpc } from "aws-cdk-lib/aws-ec2";
 import { PolicyStatement } from "aws-cdk-lib/aws-iam";
 import { Runtime } from "aws-cdk-lib/aws-lambda";
@@ -35,7 +35,21 @@ export interface SesBridgeStackProps extends StackProps {
 
     /** Subnets in `vpcId` to place `ingestHandler` in. They need a route to the internet (a NAT gateway,
      * i.e. private subnets) or VPC endpoints for S3 and SES: the handler reads each raw message from S3
-     * and bounces through SES, neither of which it can reach from a subnet with no egress. */
+     * and bounces through SES, neither of which it can reach from a subnet with no egress.
+     *
+     * **This is not optional and the companion server stack does not provide it.** A Lambda's VPC ENI
+     * never gets a public IP, regardless of the subnet's own route table - so a subnet routed only to an
+     * `InternetGateway` (a "public" subnet in the usual EC2/ALB sense) gives this Lambda *zero* egress, not
+     * reduced egress. `server/deploy/aws/rapidmx-server.yaml` (the only companion deployment this repo's
+     * own docs point at) provisions exactly one such subnet (`PublicSubnet`, routed only to its
+     * `InternetGateway` - no NAT gateway, no VPC endpoints anywhere in that template) and nothing else -
+     * passing that subnet here silently breaks every inbound message: `fetchRawMessage`/`SendBounce`/
+     * `deliver` all hang until their own timeout, the per-record `catch` this repo added logs each one and
+     * moves on, and the net effect is 100% of inbound mail dropped with no error surfaced beyond a
+     * CloudWatch line and no bounce sent either. A private subnet with a NAT gateway, or VPC endpoints for
+     * S3 and SES, must be created separately - this stack cannot verify that at `cdk synth` time (see
+     * `availabilityZones`'s own doc comment for why this stack deliberately never looks the VPC up live),
+     * so it emits a synth-time warning instead whenever a VPC is configured (see the constructor). */
     readonly subnetIds?: string[];
 
     /** The availability zones of `subnetIds`, in the same order. Only needed because this stack
@@ -63,6 +77,17 @@ export interface SesBridgeStackProps extends StackProps {
      *
      * @default "inbound/" */
     readonly objectKeyPrefix?: string;
+
+    /** How long (milliseconds) every upstream call `ingestHandler` makes - to `mtaIngestBaseUrl` and to
+     * S3/SES - may take before it gives up on that one call. Passed straight through as the Lambda's own
+     * `MTA_INGEST_TIMEOUT_MS` environment variable; `ingestHandler`'s own `requirePositiveNumber()` is what
+     * actually validates and defaults it (to `MtaIngestClient`'s `DEFAULT_MTA_INGEST_TIMEOUT_MS`, 10s) at
+     * cold start, so an unset or malformed value here just falls through to that runtime default/failure
+     * rather than being re-validated at synth time. Same env var name as `postfix-bridge`'s own
+     * `MTA_INGEST_TIMEOUT_MS`, for parity. Left as a raw string (not `number`) deliberately - CDK/Lambda
+     * environment variables are always strings, so accepting a string here avoids a pointless
+     * number-to-string-to-number round trip for a value this stack itself never needs to interpret. */
+    readonly mtaIngestTimeoutMs?: string;
 }
 
 /**
@@ -126,6 +151,22 @@ export class SesBridgeStack extends Stack {
             });
             // The subnets given, in the order given: fromVpcAttributes' privateSubnetIds are what it returns here.
             vpcSubnets = { subnets: vpc.privateSubnets };
+            // Can't verify the given subnets actually have egress (NAT gateway / VPC endpoints) at synth
+            // time without a live AWS lookup, which this stack deliberately avoids (see `subnetIds`' own
+            // doc comment). A synth-time warning is the next best thing - it surfaces in `cdk diff`/`cdk
+            // deploy` output every time a VPC is configured, not just on first setup, which matters because
+            // `server/deploy/aws/rapidmx-server.yaml`'s only subnet (`PublicSubnet`) looks superficially
+            // reusable (it exists, it's in the right VPC) while actually giving this Lambda zero egress.
+            Annotations.of(this).addWarning(
+                "ingestHandler is configured to run in a VPC. Its subnets MUST have egress to the internet " +
+                    "(a NAT gateway in a private subnet) or VPC endpoints for S3 and SES - otherwise every " +
+                    "inbound message silently fails (raw-message fetch, bounce, and delivery all hang until " +
+                    "timeout, then get logged and dropped with no bounce sent). The companion " +
+                    "server/deploy/aws/rapidmx-server.yaml stack's own PublicSubnet does NOT provide this: " +
+                    "it is routed only to an InternetGateway with no NAT gateway or VPC endpoints, and a " +
+                    "Lambda ENI never gets a public IP regardless of the subnet's route table. This cannot " +
+                    "be verified automatically at synth time - confirm it manually before deploying.",
+            );
             ingestSecurityGroup = new SecurityGroup(this, "IngestHandlerSecurityGroup", {
                 vpc,
                 description: "RapidMX ses-bridge ingest handler",
@@ -138,7 +179,16 @@ export class SesBridgeStack extends Stack {
             entry: path.join(moduleDir, "../../src/lambda/ingestHandler.ts"),
             handler: "handler",
             runtime: Runtime.NODEJS_24_X,
-            timeout: Duration.seconds(30),
+            // Deliberately below, not equal to, SES's own ~30s ceiling for a synchronous receipt-rule
+            // Lambda action (per AWS's documented behavior for this invocation type - not independently
+            // re-verified against a live deployment this session). Setting this to exactly 30s would race
+            // this function's own timeout against SES's separate, external cutoff with no way to know which
+            // fires first; this function's own "Task timed out" error is far more diagnosable in CloudWatch
+            // than whatever SES logs when it just stops waiting on its side. This margin does NOT buy more
+            // actual processing time - SES's own ceiling is the true hard limit either way - it only makes
+            // a timeout fail predictably and loudly instead of racing. See .claude/NOTES.md for the fuller
+            // writeup and the caveat that the exact SES-side number isn't independently confirmed here.
+            timeout: Duration.seconds(25),
             vpc,
             vpcSubnets,
             securityGroups: ingestSecurityGroup ? [ingestSecurityGroup] : undefined,
@@ -147,6 +197,10 @@ export class SesBridgeStack extends Stack {
                 MTA_INGEST_SECRET: props.mtaIngestSecret,
                 SES_BUCKET_NAME: bucket.bucketName,
                 SES_OBJECT_KEY_PREFIX: objectKeyPrefix,
+                // Omitted entirely (rather than set to an empty string) when unset, so `ingestHandler`'s own
+                // `requirePositiveNumber()` sees a genuinely-unset env var and falls through to its own
+                // default instead of failing on an empty string.
+                ...(props.mtaIngestTimeoutMs ? { MTA_INGEST_TIMEOUT_MS: props.mtaIngestTimeoutMs } : {}),
             },
         });
         bucket.grantRead(ingestFn, `${objectKeyPrefix}*`);

@@ -57,7 +57,18 @@ yarn deploy
 | `SES_BRIDGE_VPC_ID` | The VPC to run the ingest Lambda inside, so it can reach an internal `MTA_INGEST_BASE_URL`. Without it the Lambda runs outside any VPC and that URL must be public |
 | `SES_BRIDGE_SUBNET_IDS` | Comma-separated subnets in that VPC for the Lambda. They need egress (a NAT gateway, or VPC endpoints for S3 and SES): the handler reads each raw message from S3 and bounces through SES |
 | `SES_BRIDGE_AVAILABILITY_ZONES` | Optional, the zones of those subnets in the same order. Only needed because the stack describes the VPC rather than looking it up, so `cdk synth` needs no credentials |
+| `MTA_INGEST_TIMEOUT_MS` | Optional, how long (ms) `ingestHandler` waits on each upstream call (to `restapi` and to S3/SES) before giving up on it - default 10000. Same env var name as `postfix-bridge`'s own |
 | `CDK_DEFAULT_ACCOUNT` / `CDK_DEFAULT_REGION` | Standard CDK environment targeting - see the [CDK docs](https://docs.aws.amazon.com/cdk/v2/guide/environments.html) |
+
+**`SES_BRIDGE_SUBNET_IDS` must NOT point at `server/deploy/aws/rapidmx-server.yaml`'s own `PublicSubnet`.**
+That template provisions exactly one subnet, routed only to an `InternetGateway` - no NAT gateway, no VPC
+endpoints. A Lambda's VPC network interface never gets a public IP regardless of the subnet's route table,
+so placing `ingestHandler` there gives it **zero** egress, not reduced egress: every raw-message fetch,
+bounce, and delivery call hangs until its own timeout, gets logged, and is silently dropped - no error
+surfaces beyond a CloudWatch line, and the sender gets no bounce either. You must create a private subnet
+with its own NAT gateway (or VPC endpoints for S3 and SES) separately and pass *that* subnet's id instead.
+`cdk synth`/`cdk deploy` print a warning whenever a VPC is configured as a reminder, since this can't be
+verified automatically without a live AWS lookup (see `ses-bridge-stack.ts`'s own comments for why).
 
 The stack outputs `IngestHandlerSecurityGroupId` when it runs in a VPC: allow it on the server's internal
 ingest load balancer (or cover the subnets with the chart's

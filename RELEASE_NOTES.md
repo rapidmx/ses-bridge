@@ -27,3 +27,24 @@ contract to AWS SES.
   processed independently; a failing record is logged (CloudWatch) and skipped without affecting the rest.
 * Bumped the `@rapidmx/restapi` devDependency to `^0.19.0` and added a `<1` upper bound to its peer range,
   matching every other sibling plugin's convention.
+* Fixed `ingestHandler`'s concurrent recipient resolution being all-or-nothing: one recipient's
+  `resolveRecipient()` call throwing used to reject and discard every OTHER recipient's already-computed
+  result in the same record too, silently dropping the whole record. A recipient whose lookup fails is now
+  bounced (like an explicit "doesn't resolve") instead of taking its neighbors down with it.
+* Added a request timeout (10s default, matching `MtaIngestClient`) to the `S3Client`/`SESClient` instances
+  `ingestHandler` uses, closing the same "hung call silently consumes the Lambda's whole execution budget"
+  problem the `MtaIngestClient` timeout closed last round, for the S3/SES calls this time.
+* Fixed the DSN bounce's `ReportingMta` being hardcoded to `dns; amazonses.com` instead of the bounced
+  recipient's own domain (`senderDomain`, already computed for `BounceSender`), and its `ArrivalDate` using
+  the bounce's own wall-clock time instead of the original message's SES-recorded arrival time.
+* Added `MTA_INGEST_TIMEOUT_MS` support (validated the same way `postfix-bridge` validates its own env
+  vars: a positive number if set, or the 10s default), threaded through the CDK stack as a new optional
+  `mtaIngestTimeoutMs` prop, for parity with `postfix-bridge`'s identically-named env var.
+* Lowered the ingest Lambda's own configured timeout from 30s to 25s, so it produces its own distinctly
+  diagnosable "Task timed out" error instead of racing against SES's separate ~30s ceiling for a synchronous
+  receipt-rule Lambda action with no defined ordering between the two.
+* Documented (README and a synth-time CDK warning whenever a VPC is configured) that the companion
+  `server/deploy/aws/rapidmx-server.yaml` stack's own `PublicSubnet` cannot be used for
+  `SES_BRIDGE_SUBNET_IDS` - it has no NAT gateway or VPC endpoints, and a Lambda's VPC network interface
+  never gets a public IP regardless of the subnet's route table, so using it gives the ingest Lambda zero
+  egress and silently drops all inbound mail.

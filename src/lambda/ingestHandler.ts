@@ -5,7 +5,7 @@
 import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { SendBounceCommand, SESClient } from "@aws-sdk/client-ses";
 import { SESEvent, SESEventRecord } from "aws-lambda";
-import { MtaIngestClient } from "./MtaIngestClient.js";
+import { DEFAULT_MTA_INGEST_TIMEOUT_MS, MtaIngestClient } from "./MtaIngestClient.js";
 
 function requireEnv(name: string): string {
     const value: string | undefined = process.env[name];
@@ -15,12 +15,59 @@ function requireEnv(name: string): string {
     return value;
 }
 
+/**
+ * Parses a numeric env var, falling back to `fallback` when unset, but failing fast (rather than silently
+ * falling back to something unbounded/nonsensical) when it's *set* to something that isn't a positive,
+ * finite number - same helper (and same rationale) as `postfix-bridge`'s own `src/index.ts`. A blank or
+ * malformed `MTA_INGEST_TIMEOUT_MS` would otherwise reach `AbortSignal.timeout()`, which throws
+ * synchronously for `NaN`/a negative number, so every call would fail from the very first invocation
+ * rather than at cold-start where it's easier to diagnose.
+ */
+function requirePositiveNumber(name: string, fallback: number): number {
+    const raw: string | undefined = process.env[name];
+    if (raw === undefined) {
+        return fallback;
+    }
+    const value: number = Number(raw);
+    if (!Number.isFinite(value) || value <= 0) {
+        throw new Error(`${name} must be a positive number if set (got '${raw}').`);
+    }
+    return value;
+}
+
+// How long every upstream call (to `restapi` via MtaIngestClient, and to S3/SES via the AWS SDK clients
+// below) may take before this Lambda gives up on it rather than silently spending its whole remaining
+// execution budget on one hung call - see MtaIngestClient's own `timeoutMs` doc for why. Configurable for
+// parity with postfix-bridge's identically-named `MTA_INGEST_TIMEOUT_MS`, which was previously always
+// hardcoded here to MtaIngestClient's own default.
+const ingestTimeoutMs: number = requirePositiveNumber("MTA_INGEST_TIMEOUT_MS", DEFAULT_MTA_INGEST_TIMEOUT_MS);
+
+// AWS SDK v3 clients have NO request timeout by default (`@smithy/node-http-handler`'s own
+// `DEFAULT_REQUEST_TIMEOUT` is `0`, meaning "disabled") - without this, a hung `s3:GetObject` or
+// `ses:SendBounce` call would reopen exactly the "silently consumes the whole Lambda budget" problem
+// `MtaIngestClient`'s `timeoutMs` was added to close last round, just for the AWS SDK calls instead of the
+// `fetch()` ones. `throwOnRequestTimeout` is required for `requestTimeout` to actually reject the call
+// instead of merely logging a warning (see `NodeHttpHandlerOptions`'s own doc comment) - a rejection is
+// what lets this hung call reach `handler()`'s per-record `catch` and fail that one record instead of
+// silently stalling.
+const awsClientOptions = {
+    requestHandler: {
+        connectionTimeout: ingestTimeoutMs,
+        requestTimeout: ingestTimeoutMs,
+        throwOnRequestTimeout: true,
+    },
+};
+
 // Lambda execution environments reuse a warm container across invocations, so everything below that
 // doesn't depend on a specific event (clients, config) is deliberately created once at module load, not
 // per-invocation - the standard Lambda cold-start-cost-amortization pattern.
-const ingestClient: MtaIngestClient = new MtaIngestClient(requireEnv("MTA_INGEST_BASE_URL"), requireEnv("MTA_INGEST_SECRET"));
-const s3Client: S3Client = new S3Client({});
-const sesClient: SESClient = new SESClient({});
+const ingestClient: MtaIngestClient = new MtaIngestClient(
+    requireEnv("MTA_INGEST_BASE_URL"),
+    requireEnv("MTA_INGEST_SECRET"),
+    ingestTimeoutMs,
+);
+const s3Client: S3Client = new S3Client(awsClientOptions);
+const sesClient: SESClient = new SESClient(awsClientOptions);
 const bucketName: string = requireEnv("SES_BUCKET_NAME");
 const objectKeyPrefix: string = process.env.SES_OBJECT_KEY_PREFIX ?? "";
 
@@ -70,8 +117,13 @@ async function bounceRecipients(record: SESEventRecord, recipients: string[]): P
                 BounceType: "DoesNotExist",
             })),
             MessageDsn: {
-                ReportingMta: "dns; amazonses.com",
-                ArrivalDate: new Date(),
+                // "dns; <domain>" per RFC 3464/AWS's own documented convention - the domain that owns the
+                // bounced mailbox, not a generic AWS hostname (`senderDomain` is already derived above for
+                // `BounceSender`; this reuses the same value rather than hardcoding an unrelated literal).
+                ReportingMta: `dns; ${senderDomain}`,
+                // The message's actual SES-recorded arrival time, not the bounce's own wall-clock time -
+                // the SES event already carries it (`record.ses.mail.timestamp`).
+                ArrivalDate: new Date(record.ses.mail.timestamp),
             },
             Explanation: "The recipient's mailbox does not exist.",
         }),
@@ -80,22 +132,41 @@ async function bounceRecipients(record: SESEventRecord, recipients: string[]): P
 
 /**
  * Resolves every recipient of one record concurrently against `GET /internal/mta/resolve`, splitting them
- * into `resolved`/`unresolved` in the same order `receipt.recipients` gave them (`Promise.all` preserves
- * result order regardless of completion order, so concurrency here doesn't change `bounceRecipients()`'s
- * `recipients[0]`-derived `BounceSender` behavior). Run concurrently rather than one at a time so a single
- * slow recipient lookup doesn't serialize the rest of this record's own recipients behind it - see
- * `MtaIngestClient`'s `timeoutMs` doc for the complementary fix (a hung call now fails fast instead of
- * consuming the Lambda's whole remaining budget).
+ * into `resolved`/`unresolved` in the same order `receipt.recipients` gave them (`Promise.allSettled`
+ * preserves result order regardless of completion order, so concurrency here doesn't change
+ * `bounceRecipients()`'s `recipients[0]`-derived `BounceSender` behavior). Run concurrently rather than one
+ * at a time so a single slow recipient lookup doesn't serialize the rest of this record's own recipients
+ * behind it - see `MtaIngestClient`'s `timeoutMs` doc for the complementary fix (a hung call now fails fast
+ * instead of consuming the Lambda's whole remaining budget).
+ *
+ * Deliberately `Promise.allSettled`, not `Promise.all`: `resolveRecipient()` throws on anything other than
+ * a definitive 200/404 (see its own doc comment), and `Promise.all` is all-or-nothing - one recipient
+ * hitting a transient error would reject the whole array and discard every OTHER recipient's
+ * already-computed result too, silently dropping an entire multi-recipient record (no delivery, no bounce,
+ * just a `console.error`) over one recipient's transient failure. A recipient whose lookup threw is treated
+ * the same as an explicit "doesn't resolve" (pushed to `unresolved`, so it gets bounced) rather than
+ * aborting its neighbors. This is a real, if imperfect, trade-off: a transient lookup failure now produces
+ * a "mailbox doesn't exist" DSN for an address that might actually be valid, rather than the mail silently
+ * vanishing - preferred here since the sender at least gets a (possibly-wrong) bounce instead of nothing at
+ * all, and because `resolveRecipient()`'s own failure semantics already document why network errors and
+ * "genuinely not found" ought to be distinguished by *this* function's caller, not conflated - logging each
+ * such failure keeps that distinction visible in CloudWatch even though the bounce itself can't carry it.
  */
 async function resolveRecipients(recipients: string[]): Promise<{ resolved: string[]; unresolved: string[] }> {
-    const results = await Promise.all(
-        recipients.map(async (recipient) => ({ recipient, exists: await ingestClient.resolveRecipient(recipient) })),
-    );
+    const settled = await Promise.allSettled(recipients.map((recipient) => ingestClient.resolveRecipient(recipient)));
     const resolved: string[] = [];
     const unresolved: string[] = [];
-    for (const { recipient, exists } of results) {
-        (exists ? resolved : unresolved).push(recipient);
-    }
+    settled.forEach((result, i) => {
+        const recipient: string = recipients[i];
+        if (result.status === "fulfilled" && result.value) {
+            resolved.push(recipient);
+            return;
+        }
+        if (result.status === "rejected") {
+            console.error(`ingestHandler: resolveRecipient('${recipient}') failed, bouncing it instead:`, result.reason);
+        }
+        unresolved.push(recipient);
+    });
     return { resolved, unresolved };
 }
 

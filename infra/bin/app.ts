@@ -30,6 +30,10 @@ new SesBridgeStack(app, "SesBridgeStack", {
     vpcId: process.env.SES_BRIDGE_VPC_ID,
     subnetIds: subnetIds.length > 0 ? subnetIds : undefined,
     availabilityZones: availabilityZones.length > 0 ? availabilityZones : undefined,
+    // Unprefixed (not SES_BRIDGE_-namespaced), matching postfix-bridge's own MTA_INGEST_TIMEOUT_MS - it's
+    // the same shared MTAIngestAdapter contract config either bridge reads, just via a different transport
+    // (a Lambda's environment variable here vs. postfix-bridge's own process environment).
+    mtaIngestTimeoutMs: process.env.MTA_INGEST_TIMEOUT_MS,
     env: {
         account: process.env.CDK_DEFAULT_ACCOUNT,
         region: process.env.CDK_DEFAULT_REGION,

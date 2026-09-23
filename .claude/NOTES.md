@@ -146,3 +146,69 @@ made it over. It also had no per-call timeout on any `fetch()`.
 Verified: `yarn lint` (clean), `yarn build` (clean), `yarn test` - 26 tests passing (was 18), 100%
 statements/branches/functions/lines maintained per `vitest.config.ts`'s pinned thresholds. Not deployed to
 AWS; not verified against a live SES deployment.
+
+## 2026-09-23 — Round 3: VPC-egress trap made concrete, concurrent-resolve regression, AWS SDK timeouts
+
+A follow-up adversarial review (round 3) found new issues, including a real regression introduced by round
+2's own concurrency fix - documented here so the trade-offs aren't re-litigated.
+
+- **The VPC egress caveat from 2026-09-15 is a live trap, not a hypothetical one.** The only companion
+  deployment this repo's docs point at, `server/deploy/aws/rapidmx-server.yaml`, provisions exactly one
+  subnet (`PublicSubnet`) routed only to an `InternetGateway` - no `NatGateway`, no VPC endpoints anywhere in
+  that template (confirmed by grepping it). A Lambda's VPC ENI never gets a public IP regardless of the
+  subnet's route table, so pointing `SES_BRIDGE_SUBNET_IDS` at that subnet gives `ingestHandler` **zero**
+  egress, not reduced egress - and because last round's timeout + per-record `catch` fixes made failures
+  silent-by-design (that was the intent, for isolating one record's failure from others), the failure mode
+  here is total: every inbound message hangs until timeout, gets logged, and is dropped, with no bounce sent
+  either. Since `cdk synth` deliberately never does a live AWS lookup (see `availabilityZones`'s doc comment
+  - CI's synth job needs no credentials), this can't be verified programmatically against real route tables.
+  Fixed as far as is feasible without that live lookup: `subnetIds`' own doc comment now spells out the
+  `PublicSubnet` trap explicitly, the README has a dedicated warning block, and the stack constructor now
+  calls `Annotations.of(this).addWarning(...)` whenever a VPC is configured - confirmed via `cdk synth` with
+  `SES_BRIDGE_VPC_ID`/`SES_BRIDGE_SUBNET_IDS` set that the warning actually prints to stderr (`WARNING
+  ingestHandler is configured to run in a VPC...`).
+- **Fixed a real regression from round 2's own concurrency fix**: `resolveRecipients()` used `Promise.all()`,
+  which is all-or-nothing - `resolveRecipient()` throws by design on anything other than a definitive
+  200/404, so one recipient hitting a transient error rejected the whole array and discarded every OTHER
+  recipient's already-computed result too, silently dropping an entire multi-recipient record (no delivery,
+  no bounce, just one `console.error`) over a single recipient's transient failure. Fixed with
+  `Promise.allSettled()`: a recipient whose lookup threw is now treated the same as an explicit "doesn't
+  resolve" (bounced), rather than aborting its neighbors. Documented trade-off in the function's own doc
+  comment: this can produce a "mailbox doesn't exist" DSN for an address that might actually be fine, on a
+  purely transient error - accepted as better than the mail silently vanishing with no bounce at all.
+- **Added a request timeout to `S3Client`/`SESClient`** (`requestHandler: { connectionTimeout,
+  requestTimeout, throwOnRequestTimeout: true }`), matching `MtaIngestClient`'s own fix from last round -
+  AWS SDK v3 clients have no timeout by default (`@smithy/node-http-handler`'s `DEFAULT_REQUEST_TIMEOUT` is
+  `0`), so `fetchRawMessage`'s S3 read and `bounceRecipients`' SES bounce had reopened exactly the
+  "silently consumes the whole Lambda budget" problem last round closed only for the `fetch()` calls.
+  `throwOnRequestTimeout: true` is required - without it `requestTimeout` only logs a warning and does NOT
+  reject the call, which would defeat the point entirely.
+- **Added `MTA_INGEST_TIMEOUT_MS` env var support** (`requirePositiveNumber()`, same helper/rationale as
+  `postfix-bridge`'s own), threaded through the new S3/SES client timeouts and `MtaIngestClient`'s own
+  `timeoutMs` alike (one env var controls all of them, since they all exist to solve the same problem).
+  Wired through the CDK stack too (`mtaIngestTimeoutMs` prop -> `MTA_INGEST_TIMEOUT_MS` Lambda env var,
+  `infra/bin/app.ts` reads it unprefixed, matching postfix-bridge's own naming) so it's actually settable at
+  deploy time, not just at the Lambda-runtime level.
+- **Lowered the Lambda's own `timeout` from 30s to 25s.** Per AWS's documented behavior for a synchronous
+  (`RequestResponse`) SES receipt-rule Lambda action, SES itself has a separate ~30s ceiling on how long it
+  waits - **not independently re-verified against a live deployment this session**, carried over from
+  general AWS documentation familiarity, same epistemic caveat as this repo's other "not verified live"
+  notes. Setting the Lambda's own timeout to exactly 30s would race this function's own timeout against
+  that separate SES-side cutoff with no defined ordering; 25s guarantees this function's own timeout fires
+  first, giving a clean, diagnosable "Task timed out" CloudWatch entry instead of whatever SES logs when it
+  independently gives up waiting. **This does not create more actual processing time** - SES's own ceiling
+  (if the ~30s figure is accurate) remains the true hard limit regardless of this function's configured
+  value - it only makes the failure mode predictable. If a live deployment ever contradicts the assumed 30s
+  SES-side number, revisit this margin.
+- **Fixed two cheap, unrelated bugs found in the same pass**: the DSN bounce's `ReportingMta` was hardcoded
+  to the literal `"dns; amazonses.com"` instead of reusing `senderDomain` (already computed correctly for
+  `BounceSender` on the very next line) - AWS's own documented convention is `dns; <domain-that-owns-the-
+  mailbox>`, not a generic AWS hostname. And `ArrivalDate` used the bounce's own wall-clock time (`new
+  Date()`) instead of the original message's actual SES-recorded arrival time, which the event already
+  carries (`record.ses.mail.timestamp`) and `bounceRecipients()` already has `record` in scope for.
+
+Verified: `yarn lint` (clean), `yarn build` (clean), `yarn test` - 34 tests passing (was 26), 100%
+statements/branches/functions/lines maintained. `cdk synth` both without a VPC (unchanged output) and with
+`SES_BRIDGE_VPC_ID`/`SES_BRIDGE_SUBNET_IDS`/`MTA_INGEST_TIMEOUT_MS=5000` set - confirmed in the synthesized
+template that `MTA_INGEST_TIMEOUT_MS: "5000"` reaches the Lambda's environment and `Timeout: 25` is set, and
+confirmed the VPC warning prints on stderr. Not deployed to AWS.
