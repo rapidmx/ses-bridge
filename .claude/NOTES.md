@@ -98,3 +98,51 @@ the chart's `mail.ingestService` is an internal load balancer, and the public Ga
 Verified: `tsc --noEmit`, eslint, 18 tests; `cdk synth` without a VPC (unchanged) and with
 `SES_BRIDGE_VPC_ID=vpc-… SES_BRIDGE_SUBNET_IDS=subnet-aaa,subnet-bbb` - the Lambda gets a `VpcConfig` with both subnets
 and the new security group, and CDK attaches AWSLambdaVPCAccessExecutionRole. Not deployed to AWS.
+
+## 2026-09-22 — Ported postfix-bridge's comma-envelope/timeout fixes, isolated per-record failures
+
+An adversarial cross-repo review found `MtaIngestClient.ts` here still had the exact HIGH-severity bug
+`postfix-bridge` fixed in `d7a1430`/`0b21d0d`: `deliver()` joined multiple `X-Envelope-To` recipients with
+a bare `,`, which is ambiguous whenever a quoted local part legally contains a literal comma (RFC 5321) -
+this file had simply never been touched since its original scaffold commit (`c6521e8`), so the fix never
+made it over. It also had no per-call timeout on any `fetch()`.
+
+- **Ported `encodeEnvelopeAddress()`** (percent-encoding via `encodeURIComponent`) verbatim from
+  `postfix-bridge`, applied to `envelopeFrom` and every `envelopeTo` entry before they go into
+  `X-Envelope-From`/`X-Envelope-To`. Same caveat as postfix-bridge's own fix: `restapi`'s
+  `BaseMailIngestRoute.deliver()` still splits `X-Envelope-To` on a bare `,` and doesn't yet
+  `decodeURIComponent` its segments - that companion fix belongs to that repo. This change only guarantees
+  the *count* of recipients survives a comma-containing address intact.
+- **Ported the `timeoutMs`/`DEFAULT_MTA_INGEST_TIMEOUT_MS` (10s) + `AbortSignal.timeout()` pattern** to all
+  three `MtaIngestClient` calls. Lambda-specific nuance vs. postfix-bridge: a hung call here can't hang
+  "forever" (the Lambda's own 30s function timeout in `ses-bridge-stack.ts` bounds it regardless), but
+  without a client-side timeout it *silently consumes that entire remaining budget* on one call - worse
+  than it sounds, since `ingestHandler` was previously resolving a record's recipients one at a time, so a
+  single hung lookup starved every other recipient/record in the invocation from being processed at all.
+- **Changed `ingestHandler`'s recipient resolution to run concurrently** (`Promise.all`, order preserved -
+  see the new `resolveRecipients()` helper) instead of sequentially, so a slow recipient no longer
+  serializes the rest of that record's own lookups behind it. Combined with the timeout above, this is the
+  full fix for the "one recipient starves the batch" reliability issue.
+- **Isolated per-record failures in `handler()`**: each record is now processed inside its own `try`/`catch`
+  instead of one shared loop body whose exception rejects the whole invocation. Investigated whether this
+  matters given the event source: a synchronous (`RequestResponse`) SES Lambda receipt action has no
+  SQS-style per-item failure reporting, and on-failure destinations/DLQs only attach to *asynchronous*
+  (`Event`) invocations, so neither of those safety nets is available or configured for this function. Before
+  this fix, one record's failure (e.g. a transient `deliver()` error) rejecting the whole handler risked a
+  retry of the *entire* invocation redelivering/re-bouncing every other record in the same event that had
+  already succeeded - real duplicate-mail risk, not hypothetical. `console.error` (CloudWatch Logs) is the
+  failure-visibility mechanism now used, since there's nothing else to hook into for this invocation type.
+- **Bumped `@rapidmx/restapi` devDependency to `^0.19.0`** (was `^0.4.0`, far behind) **and added a `<1`
+  upper bound to its peer range** (`>=0.4.0 <1`), matching every sibling plugin's convention. No source file
+  under `src/` imports anything from `restapi` (only doc-comment references - this bridge only talks to it
+  over the documented HTTP contract), so this was manifest-only; confirmed via `yarn install`/`yarn
+  build`/`yarn test`. Note: `yarn install` prints a pre-existing `doesn't provide @rapidrest/service-core`
+  peer warning (restapi's own peer dependency) - confirmed via `git stash` that this warning already existed
+  before this bump too, not newly introduced by it; every other sibling plugin that depends on
+  `restapi@^0.19.0` also declares `@rapidrest/service-core` (peer `2.x`, dev `^2.1.1`) to silence the
+  equivalent warning in their own installs - left alone here since it doesn't fail the install/build/test and
+  wasn't in scope for this pass, but worth adding if this warning ever needs to be silenced.
+
+Verified: `yarn lint` (clean), `yarn build` (clean), `yarn test` - 26 tests passing (was 18), 100%
+statements/branches/functions/lines maintained per `vitest.config.ts`'s pinned thresholds. Not deployed to
+AWS; not verified against a live SES deployment.

@@ -30,7 +30,7 @@
     "trailingComma": "es5"
   },
   "peerDependencies": {
-    "@rapidmx/restapi": ">=0.4.0",
+    "@rapidmx/restapi": ">=0.4.0 <1",
     "@rapidrest/core": "5.x"
   },
   "dependencies": {
@@ -39,7 +39,7 @@
     "@aws-sdk/client-sesv2": "^3.906.0"
   },
   "devDependencies": {
-    "@rapidmx/restapi": "^0.4.0",
+    "@rapidmx/restapi": "^0.19.0",
     "@rapidrest/core": "^5.2.2",
     "@types/aws-lambda": "^8.10.156",
     "@types/node": "^26.5.0",

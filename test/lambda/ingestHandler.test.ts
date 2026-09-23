@@ -167,6 +167,65 @@ describe("ingestHandler Tests", () => {
         expect(mockS3Send).toHaveBeenCalledWith(expect.objectContaining({ input: { Bucket: "test-bucket", Key: "inbound/msg-b" } }));
     });
 
+    it("Isolates a failing record: its error doesn't stop other records in the same event or fail the invocation.", async () => {
+        // A synchronous SES Lambda receipt action has no SQS-style per-item failure reporting - if the
+        // whole handler() rejected here, SES would retry the ENTIRE invocation, redelivering the record
+        // that already succeeded below a second time. Verifies that no longer happens: one record's
+        // deliver() throwing is caught and logged, while the other record in the same event still
+        // completes and the invocation as a whole resolves normally.
+        const consoleErrorSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+        mockResolveRecipient.mockResolvedValue(true);
+        mockS3Send.mockResolvedValue(s3GetObjectResponse("raw"));
+        mockDeliver.mockImplementation(async (_from: string, recipients: string[]) => {
+            if (recipients.includes("fails@example.com")) {
+                throw new Error("restapi unavailable");
+            }
+        });
+
+        const event = makeEvent(["fails@example.com"], { messageId: "msg-fail" });
+        event.Records.push(makeEvent(["ok@example.com"], { messageId: "msg-ok" }).Records[0]);
+
+        const result = await handler(event);
+
+        expect(mockDeliver).toHaveBeenCalledTimes(2);
+        expect(mockDeliver).toHaveBeenCalledWith(expect.any(String), ["ok@example.com"], expect.any(Buffer));
+        expect(consoleErrorSpy).toHaveBeenCalledWith(expect.stringContaining("msg-fail"), expect.any(Error));
+        // The record that succeeded is still reflected in the result - one failure doesn't drag the whole
+        // invocation's outcome down with it.
+        expect(result).toEqual({ disposition: "CONTINUE" });
+
+        consoleErrorSpy.mockRestore();
+    });
+
+    it("Resolves every recipient of a record concurrently, in the order the receipt gave them, regardless of which settles first.", async () => {
+        // Deliberately resolves out of call order (the second recipient resolves before the first) - if
+        // resolution were still sequential/order-dependent, resolved/unresolved would come out scrambled.
+        mockResolveRecipient.mockImplementation(
+            (rcpt: string) =>
+                new Promise<boolean>((resolve) => {
+                    const delayMs = rcpt === "slow@example.com" ? 10 : 0;
+                    setTimeout(() => resolve(rcpt !== "unknown@example.com"), delayMs);
+                }),
+        );
+        mockS3Send.mockResolvedValue(s3GetObjectResponse("raw"));
+
+        const result = await handler(makeEvent(["slow@example.com", "unknown@example.com", "fast@example.com"]));
+
+        expect(mockDeliver).toHaveBeenCalledWith(
+            "sender@external.com",
+            ["slow@example.com", "fast@example.com"],
+            expect.any(Buffer),
+        );
+        expect(mockSesSend).toHaveBeenCalledWith(
+            expect.objectContaining({
+                input: expect.objectContaining({
+                    BouncedRecipientInfoList: [{ Recipient: "unknown@example.com", BounceType: "DoesNotExist" }],
+                }),
+            }),
+        );
+        expect(result).toEqual({ disposition: "CONTINUE" });
+    });
+
     it("Falls back to mailer-daemon@localhost when the bounced recipient address has no domain.", async () => {
         mockResolveRecipient.mockResolvedValue(false);
 
