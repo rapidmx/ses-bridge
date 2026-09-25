@@ -48,3 +48,4 @@ contract to AWS SES.
   `SES_BRIDGE_SUBNET_IDS` - it has no NAT gateway or VPC endpoints, and a Lambda's VPC network interface
   never gets a public IP regardless of the subnet's route table, so using it gives the ingest Lambda zero
   egress and silently drops all inbound mail.
+* Bumped the `@rapidmx/restapi` devDependency to `^0.21.1` (peer range unchanged) and rebuilt against it.
