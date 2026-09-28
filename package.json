@@ -1,6 +1,6 @@
 {
   "name": "@rapidmx/ses-bridge",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Bridges a RapidMX server's outbound MailTransport interface and inbound /internal/mta ingest contract to AWS SES.",
   "type": "module",
   "repository": "https://github.com/rapidmx/ses-bridge",
