@@ -2,7 +2,7 @@
 // Copyright (C) 2026 Jean-Philippe Steinmetz
 // SPDX-License-Identifier: MPL-2.0
 ///////////////////////////////////////////////////////////////////////////////
-import { GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
+import { DeleteObjectCommand, GetObjectCommand, S3Client } from "@aws-sdk/client-s3";
 import { SendBounceCommand, SESClient } from "@aws-sdk/client-ses";
 import { SESEvent, SESEventRecord } from "aws-lambda";
 import { DEFAULT_MTA_INGEST_TIMEOUT_MS, MtaIngestClient } from "./MtaIngestClient.js";
@@ -89,6 +89,20 @@ async function fetchRawMessage(messageId: string): Promise<Buffer> {
     const res = await s3Client.send(new GetObjectCommand({ Bucket: bucketName, Key: objectKeyFor(messageId) }));
     const bytes: Uint8Array = await res.Body!.transformToByteArray();
     return Buffer.from(bytes);
+}
+
+/**
+ * Deletes the staged raw message once RapidMX has accepted it. With zero-access encryption on (RapidMX's
+ * `specs/search.md` §3), the server keeps no readable copy of a message - this bucket's would be the last one, so it
+ * goes as soon as the server has the message. Best-effort: a failure is logged, and the bucket's lifecycle rule is the
+ * backstop. Never called for a message the server didn't accept, which SES retries from this same object.
+ */
+async function deleteRawMessage(messageId: string): Promise<void> {
+    try {
+        await s3Client.send(new DeleteObjectCommand({ Bucket: bucketName, Key: objectKeyFor(messageId) }));
+    } catch (err) {
+        console.warn(`ingestHandler: could not delete the staged message '${messageId}'; the bucket's lifecycle rule will:`, err);
+    }
 }
 
 /**
@@ -207,6 +221,7 @@ export async function handler(event: SESEvent): Promise<{ disposition: "CONTINUE
                 const raw: Buffer = await fetchRawMessage(mail.messageId);
                 await ingestClient.deliver(mail.source, resolved, raw);
                 anyDelivered = true;
+                await deleteRawMessage(mail.messageId);
             }
         } catch (err) {
             // Swallow and move on to the next record - see this function's own doc comment for why the

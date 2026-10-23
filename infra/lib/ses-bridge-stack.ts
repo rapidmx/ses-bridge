@@ -121,15 +121,14 @@ export class SesBridgeStack extends Stack {
             dkimSigning: true,
         });
 
-        // Transient hand-off storage only - `/internal/mta/deliver` persists to RapidMX's own BlobStore
-        // immediately, so nothing here needs to survive longer than it takes `ingestHandler` to read it
-        // back (a lifecycle rule, not `ingestHandler` itself, is the actual cleanup mechanism - the
-        // handler never deletes what it reads, matching how a real MTA doesn't delete a message it
-        // couldn't confirm was durably queued downstream).
+        // Transient hand-off storage only. `ingestHandler` deletes each message once RapidMX has accepted it - with
+        // zero-access encryption the server keeps no readable copy, so this one must not linger either - and never one it
+        // couldn't confirm was accepted (SES retries from it). The lifecycle rule is only the backstop for a delete that
+        // failed, so it's short.
         const bucket: Bucket = new Bucket(this, "InboundBucket", {
             blockPublicAccess: BlockPublicAccess.BLOCK_ALL,
             enforceSSL: true,
-            lifecycleRules: [{ expiration: Duration.days(7), prefix: objectKeyPrefix }],
+            lifecycleRules: [{ expiration: Duration.days(1), prefix: objectKeyPrefix }],
             removalPolicy: RemovalPolicy.RETAIN,
         });
 
@@ -204,6 +203,7 @@ export class SesBridgeStack extends Stack {
             },
         });
         bucket.grantRead(ingestFn, `${objectKeyPrefix}*`);
+        bucket.grantDelete(ingestFn, `${objectKeyPrefix}*`);
         // `ses:SendBounce` has no documented resource-level restriction narrower than "*" - see
         // ingestHandler.ts's own bounceRecipients() for why this Lambda needs it at all.
         ingestFn.addToRolePolicy(

@@ -22,7 +22,10 @@ const mockS3ClientCtor = vi.fn(function (this: { send: typeof mockS3Send }) {
 vi.mock("@aws-sdk/client-s3", () => ({
     S3Client: mockS3ClientCtor,
     GetObjectCommand: vi.fn().mockImplementation(function (input: any) {
-        return { input };
+        return { input, command: "GetObject" };
+    }),
+    DeleteObjectCommand: vi.fn().mockImplementation(function (input: any) {
+        return { input, command: "DeleteObject" };
     }),
 }));
 
@@ -121,6 +124,40 @@ describe("ingestHandler Tests", () => {
         );
         expect(mockSesSend).not.toHaveBeenCalled();
         expect(result).toEqual({ disposition: "CONTINUE" });
+    });
+
+    it("Deletes the staged message once the server has accepted it, and only then.", async () => {
+        mockResolveRecipient.mockResolvedValue(true);
+        mockS3Send.mockResolvedValue(s3GetObjectResponse("From: sender@external.com\r\n\r\nHi"));
+
+        await handler(makeEvent(["a@example.com"], { messageId: "msg-7" }));
+
+        expect(mockS3Send).toHaveBeenLastCalledWith({ input: { Bucket: "test-bucket", Key: "inbound/msg-7" }, command: "DeleteObject" });
+        const order = mockS3Send.mock.calls.map(([command]) => command.command);
+        expect(order).toEqual(["GetObject", "DeleteObject"]);
+        expect(mockDeliver.mock.invocationCallOrder[0]).toBeLessThan(mockS3Send.mock.invocationCallOrder[1]);
+    });
+
+    it("Keeps the staged message when the server didn't accept it, so SES's retry can read it again.", async () => {
+        mockResolveRecipient.mockResolvedValue(true);
+        mockS3Send.mockResolvedValue(s3GetObjectResponse("From: sender@external.com\r\n\r\nHi"));
+        mockDeliver.mockRejectedValue(new Error("Unexpected status 503"));
+        vi.spyOn(console, "error").mockImplementation(() => undefined);
+
+        await handler(makeEvent(["a@example.com"], { messageId: "msg-8" }));
+
+        expect(mockS3Send.mock.calls.map(([command]) => command.command)).toEqual(["GetObject"]);
+    });
+
+    it("Still reports the message delivered when deleting the staged copy fails - the lifecycle rule is the backstop.", async () => {
+        mockResolveRecipient.mockResolvedValue(true);
+        mockS3Send.mockResolvedValueOnce(s3GetObjectResponse("From: sender@external.com\r\n\r\nHi")).mockRejectedValueOnce(new Error("AccessDenied"));
+        const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+
+        const result = await handler(makeEvent(["a@example.com"], { messageId: "msg-9" }));
+
+        expect(result).toEqual({ disposition: "CONTINUE" });
+        expect(warn).toHaveBeenCalledWith(expect.stringContaining("msg-9"), expect.any(Error));
     });
 
     it("Bounces only the recipients that don't resolve, and still delivers to the ones that do.", async () => {
