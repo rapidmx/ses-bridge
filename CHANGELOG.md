@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0] - 2026-10-24
+
+### Added
+- Added the missing "Enable corepack" step to the validate job - every other job already has it, and without it yarn runs the container's stock Yarn 1.22.22 instead of the packageManager-pinned version, which refuses to run at all against a packageManager field, so validate's yarn npm audit never actually ran regardless of real findings. Confirmed on rapidmx/server's identical job via a real CI log; this repo's validate job is the same template and shares the same latent gap even where it happened not to manifest yet
+
+### Changed
+- Document the standing wait-for-green-CI-before-releasing rule in NOTES, per JP
+- Publish a prerelease version to npm under the next tag, which npm requires, and a release under latest
+- Delete the staged S3 copy of an inbound message once RapidMX has accepted it, so no plaintext copy outlives delivery under zero-access encryption
+- Keep the staged copy when delivery fails so SES retries from it, and only log a failed delete
+- Shorten the inbound bucket's lifecycle backstop from 7 days to 1 and grant the handler s3:DeleteObject
+- Build against @rapidmx/restapi ^0.34.0
+- Describe the zero-access encryption changes in the release notes
+
 ## [0.1.1] - 2026-09-28
 
 ### Added
@@ -42,5 +56,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial scaffold: SesMailTransport (a MailTransport implementation for outbound mail via AWS SES), an ingestHandler Lambda translating SES receipt events into the same /internal/mta/resolve + /internal/mta/deliver calls postfix-bridge makes, and a CDK app provisioning the S3 bucket/receipt rule/Lambda/IAM role this needs
 
-[Unreleased]: https://github.com/rapidmx/ses-bridge/compare/v0.1.1...HEAD
+[Unreleased]: https://github.com/rapidmx/ses-bridge/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/rapidmx/ses-bridge/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/rapidmx/ses-bridge/releases/tag/v0.1.1
