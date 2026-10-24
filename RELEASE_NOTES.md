@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+### Changed
+
+- **The staged S3 copy of an inbound message is deleted once RapidMX accepts it**, so no readable copy outlives delivery when the mailbox uses zero-access encryption. The bucket's lifecycle rule remains as a backstop for messages that are never accepted.
+
 ## v0.1.1
 
 Bridges a RapidMX server's outbound `MailTransport` interface and inbound `/internal/mta` ingest
