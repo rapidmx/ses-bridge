@@ -39,7 +39,7 @@
     "@aws-sdk/client-sesv2": "^3.1162.0"
   },
   "devDependencies": {
-    "@rapidmx/restapi": "^0.36.0",
+    "@rapidmx/restapi": "^0.37.0",
     "@rapidrest/core": "^6.1.0",
     "@types/aws-lambda": "^8.10.164",
     "@types/node": "^26.6.6",
