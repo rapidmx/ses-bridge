@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.3.0] - 2026-11-05
+
+### Added
+- Added the rule that the more specific agent model assignment wins where categories overlap
+- Added the RapidREST Claude Code plugin to the project settings
+
+### Changed
+- Publish only from a release tag's own Build, and only once every Build of that commit has finished green
+- Record the standing agent model assignments in the project notes
+- Move the agent model assignments to the top of the project notes, keeping session history at the bottom
+- Update the agent model assignments to JP's revised criteria: Sonnet for general code and review, Opus for architecture, planning, investigation, security and performance, Haiku for simple operations
+- Upgrade @rapidrest/core to 6.1.0
+- Raise the @rapidrest/core peer range from 5.x to 6.x, which @rapidrest/service-core 2.5 requires
+- Upgrade @rapidmx/restapi to ^0.36.0
+- Upgrade every other dependency to its latest release, keeping typescript on 6.x
+- Install corepack globally before enabling it in CI, since the node:lts images no longer bundle it
+- Upgrade @rapidmx/restapi to ^0.37.0
+
 ## [0.2.0] - 2026-10-24
 
 ### Added
@@ -56,6 +74,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 - Initial scaffold: SesMailTransport (a MailTransport implementation for outbound mail via AWS SES), an ingestHandler Lambda translating SES receipt events into the same /internal/mta/resolve + /internal/mta/deliver calls postfix-bridge makes, and a CDK app provisioning the S3 bucket/receipt rule/Lambda/IAM role this needs
 
-[Unreleased]: https://github.com/rapidmx/ses-bridge/compare/v0.2.0...HEAD
+[Unreleased]: https://github.com/rapidmx/ses-bridge/compare/v0.3.0...HEAD
+[0.3.0]: https://github.com/rapidmx/ses-bridge/compare/v0.2.0...v0.3.0
 [0.2.0]: https://github.com/rapidmx/ses-bridge/compare/v0.1.1...v0.2.0
 [0.1.1]: https://github.com/rapidmx/ses-bridge/releases/tag/v0.1.1
